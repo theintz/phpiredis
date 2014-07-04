@@ -21,8 +21,25 @@ static
 void convert_redis_to_php(phpiredis_reader* reader, zval* return_value, redisReply* reply TSRMLS_DC);
 
 static
+void free_error_callback(phpiredis_connection *connection TSRMLS_DC)
+{
+    // calling this function during shutdown leads to a segfault, because the error handler has already
+    // been deallocated by the runtime engine.
+    if (connection->error_callback != NULL) {
+        // we must not free the function itself, because that deletes the actual PHP object,
+        // so we only decrease the reference counter
+        Z_DELREF_PP(&((callback*) connection->error_callback)->function);
+        efree(connection->error_callback);
+        connection->error_callback = NULL;
+    }
+}
+
+static
 void s_destroy_connection(phpiredis_connection *connection TSRMLS_DC)
 {
+    // we explicitly don't free the error callback during shutdown, because it is usually already deallocated
+    // this may create a memory leak, but I don't know how to properly deallocate the structure and since
+    // we are shutting down anyway, it's only a problem on a principle level
     if (connection) {
         pefree(connection->ip, connection->is_persistent);
         if (connection->c != NULL) {
@@ -80,13 +97,51 @@ phpiredis_connection *s_create_connection (const char *ip, int port, zend_bool i
         return NULL;
     }
 
-    connection                = pemalloc(sizeof(phpiredis_connection), is_persistent);
-    connection->c             = c;
-    connection->ip            = pestrdup(ip, is_persistent);
-    connection->port          = port;
-    connection->is_persistent = is_persistent;
+    connection                 = pemalloc(sizeof(phpiredis_connection), is_persistent);
+    connection->c              = c;
+    connection->ip             = pestrdup(ip, is_persistent);
+    connection->port           = port;
+    connection->is_persistent  = is_persistent;
+    connection->error_callback = NULL;
 
     return connection;
+}
+
+static
+int handle_error_callback(phpiredis_connection *connection, int type, char *msg, int len TSRMLS_DC) {
+    if (connection->error_callback == NULL) {
+        // raise PHP error if no handler is set
+        php_error_docref(NULL TSRMLS_CC, E_WARNING, "%s", msg);
+        return SUCCESS;
+    }
+
+    zval *arg[2];
+    zval *return_value;
+    int retval = SUCCESS;
+
+    MAKE_STD_ZVAL(arg[0]);
+    ZVAL_LONG(arg[0], type);
+    MAKE_STD_ZVAL(arg[1]);
+
+    // only set second argument when msg is given
+    if (msg != NULL && len > 0) {
+        ZVAL_STRINGL(arg[1], msg, len, 1);
+    }
+
+    MAKE_STD_ZVAL(return_value);
+
+    if (call_user_function(EG(function_table), NULL, ((callback*) connection->error_callback)->function, return_value, 2, arg TSRMLS_CC) == FAILURE) {
+        // return FAILURE to signal something went wrong with the error handler
+        retval = FAILURE;
+    }
+
+    // TODO: we could also return whatever the error handler returned to allow for more flexibility
+    zval_ptr_dtor(&return_value);
+    zval_ptr_dtor(&arg[0]);
+    zval_ptr_dtor(&arg[1]);
+
+    // return SUCCESS to signal successful execution of the error handler
+    return retval;
 }
 
 PHP_FUNCTION(phpiredis_connect)
@@ -133,6 +188,8 @@ PHP_FUNCTION(phpiredis_pconnect)
         }
 
         connection = (phpiredis_connection *) le->ptr;
+        // reset error handler, as it was cleaned up after the last request
+        connection->error_callback = NULL;
 
         ZEND_REGISTER_RESOURCE(return_value, connection, le_redis_persistent_context);
         efree(hashed_details);
@@ -173,6 +230,39 @@ PHP_FUNCTION(phpiredis_disconnect)
 
     ZEND_FETCH_RESOURCE2(c, redisContext *, &connection, -1, PHPIREDIS_CONNECTION_NAME, le_redis_context, le_redis_persistent_context);
     zend_list_delete(Z_LVAL_P(connection));
+
+    RETURN_TRUE;
+}
+
+PHP_FUNCTION(phpiredis_set_error_handler)
+{
+    zval *ptr, **function;
+    phpiredis_connection *connection;
+    char *name;
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "rZ", &ptr, &function) == FAILURE) {
+        return;
+    }
+
+    ZEND_FETCH_RESOURCE2(connection, phpiredis_connection *, &ptr, -1, PHPIREDIS_CONNECTION_NAME, le_redis_context, le_redis_persistent_context);
+
+    if ((*function)->type == IS_NULL) {
+        free_error_callback(connection TSRMLS_CC);
+    } else {
+        if (!zend_is_callable(*function, 0, &name TSRMLS_CC)) {
+            php_error_docref(NULL TSRMLS_CC, E_WARNING, "Argument is not a valid callback");
+            efree(name);
+            RETURN_FALSE;
+        }
+
+        efree(name);
+        free_error_callback(connection TSRMLS_CC);
+
+        connection->error_callback = emalloc(sizeof(callback));
+
+        Z_ADDREF_PP(function);
+        ((callback*) connection->error_callback)->function = *function;
+    }
 
     RETURN_TRUE;
 }
@@ -220,10 +310,16 @@ PHP_FUNCTION(phpiredis_multi_command)
                 add_index_bool(return_value, i, 0);
             }
 
+            handle_error_callback(connection, PHPIREDIS_ERROR_CONNECTION, connection->c->errstr, strlen(connection->c->errstr) TSRMLS_CC);
             if (reply) freeReplyObject(reply);
 
-            efree(result);
+            zval_ptr_dtor(result);
+
             break;
+        }
+
+        if (reply->type == REDIS_REPLY_ERROR) {
+            handle_error_callback(connection, PHPIREDIS_ERROR_PROTOCOL, reply->str, reply->len TSRMLS_CC);
         }
 
         convert_redis_to_php(NULL, result, reply TSRMLS_CC);
@@ -309,10 +405,15 @@ PHP_FUNCTION(phpiredis_multi_command_bs)
                 add_index_bool(return_value, i, 0);
             }
 
+            handle_error_callback(connection, PHPIREDIS_ERROR_CONNECTION, connection->c->errstr, strlen(connection->c->errstr) TSRMLS_CC);
             if (reply) freeReplyObject(reply);
 
-            efree(result);
+            zval_ptr_dtor(result);
             break;
+        }
+
+        if (reply->type == REDIS_REPLY_ERROR) {
+            handle_error_callback(connection, PHPIREDIS_ERROR_PROTOCOL, reply->str, reply->len TSRMLS_CC);
         }
 
         convert_redis_to_php(NULL, result, reply TSRMLS_CC);
@@ -338,11 +439,13 @@ PHP_FUNCTION(phpiredis_command)
     reply = redisCommand(connection->c, command);
 
     if (reply == NULL) {
+        handle_error_callback(connection, PHPIREDIS_ERROR_CONNECTION, connection->c->errstr, strlen(connection->c->errstr) TSRMLS_CC);
+
         RETURN_FALSE;
     }
 
     if (reply->type == REDIS_REPLY_ERROR) {
-        php_error_docref(NULL TSRMLS_CC, E_WARNING, "%s", reply->str);
+        handle_error_callback(connection, PHPIREDIS_ERROR_PROTOCOL, reply->str, reply->len TSRMLS_CC);
         freeReplyObject(reply);
 
         RETURN_FALSE;
@@ -418,6 +521,8 @@ PHP_FUNCTION(phpiredis_command_bs)
     efree(argvlen);
 
     if (redisGetReply(connection->c, &reply) != REDIS_OK) {
+        handle_error_callback(connection, PHPIREDIS_ERROR_CONNECTION, connection->c->errstr, strlen(connection->c->errstr) TSRMLS_CC);
+
         // only free if the reply was actually created
         if (reply) freeReplyObject(reply);
 
@@ -425,7 +530,7 @@ PHP_FUNCTION(phpiredis_command_bs)
     }
 
     if (reply->type == REDIS_REPLY_ERROR) {
-        php_error_docref(NULL TSRMLS_CC, E_WARNING, "%s", reply->str);
+        handle_error_callback(connection, PHPIREDIS_ERROR_PROTOCOL, reply->str, reply->len TSRMLS_CC);
         freeReplyObject(reply);
 
         RETURN_FALSE;
@@ -681,7 +786,6 @@ PHP_FUNCTION(phpiredis_reader_reset)
     reader->reader = redisReplyReaderCreate();
 }
 
-
 PHP_FUNCTION(phpiredis_reader_destroy)
 {
     zval *ptr;
@@ -820,6 +924,9 @@ PHP_MINIT_FUNCTION(phpiredis)
     REGISTER_LONG_CONSTANT("PHPIREDIS_REPLY_STATUS", REDIS_REPLY_STATUS, CONST_PERSISTENT|CONST_CS);
     REGISTER_LONG_CONSTANT("PHPIREDIS_REPLY_ERROR", REDIS_REPLY_ERROR, CONST_PERSISTENT|CONST_CS);
 
+    REGISTER_LONG_CONSTANT("PHPIREDIS_ERROR_CONNECTION", PHPIREDIS_ERROR_CONNECTION, CONST_PERSISTENT|CONST_CS);
+    REGISTER_LONG_CONSTANT("PHPIREDIS_ERROR_PROTOCOL", PHPIREDIS_ERROR_PROTOCOL, CONST_PERSISTENT|CONST_CS);
+
     return SUCCESS;
 }
 
@@ -827,6 +934,7 @@ static zend_function_entry phpiredis_functions[] = {
     PHP_FE(phpiredis_connect, NULL)
     PHP_FE(phpiredis_pconnect, NULL)
     PHP_FE(phpiredis_disconnect, NULL)
+    PHP_FE(phpiredis_set_error_handler, NULL)
     PHP_FE(phpiredis_command, NULL)
     PHP_FE(phpiredis_command_bs, NULL)
     PHP_FE(phpiredis_multi_command, NULL)
