@@ -313,7 +313,7 @@ PHP_FUNCTION(phpiredis_multi_command)
             handle_error_callback(connection, PHPIREDIS_ERROR_CONNECTION, connection->c->errstr, strlen(connection->c->errstr) TSRMLS_CC);
             if (reply) freeReplyObject(reply);
 
-            zval_ptr_dtor(result);
+            zval_ptr_dtor(&result);
 
             break;
         }
@@ -408,7 +408,7 @@ PHP_FUNCTION(phpiredis_multi_command_bs)
             handle_error_callback(connection, PHPIREDIS_ERROR_CONNECTION, connection->c->errstr, strlen(connection->c->errstr) TSRMLS_CC);
             if (reply) freeReplyObject(reply);
 
-            zval_ptr_dtor(result);
+            zval_ptr_dtor(&result);
             break;
         }
 
