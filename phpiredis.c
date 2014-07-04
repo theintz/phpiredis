@@ -85,17 +85,24 @@ void php_redis_reader_dtor(zend_rsrc_list_entry *rsrc TSRMLS_DC)
 }
 
 static
-phpiredis_connection *s_create_connection (const char *ip, int port, zend_bool is_persistent)
+phpiredis_connection *s_create_connection (const char *ip, int port, long timeoutInMs, zend_bool is_persistent)
 {
     redisContext *c;
     phpiredis_connection *connection;
 
-    c = redisConnect(ip, port);
+    // build timeout
+    struct timeval timeout;
+    timeout.tv_sec = (time_t)(timeoutInMs / 1000);
+    timeout.tv_usec = (suseconds_t)(timeoutInMs * 1000);
+
+    c = redisConnectWithTimeout(ip, port, timeout);
 
     if (!c || c->err) {
         redisFree(c);
         return NULL;
     }
+
+    // TODO: set timeout using redisSetTimeout, but this only works for timeouts > 1 sec. why?
 
     connection                 = pemalloc(sizeof(phpiredis_connection), is_persistent);
     connection->c              = c;
@@ -150,12 +157,13 @@ PHP_FUNCTION(phpiredis_connect)
     char *ip;
     int ip_size;
     long port = 6379;
+    long timeoutInMs = 1000; // default timeout is 1 second
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|l", &ip, &ip_size, &port) == FAILURE) {
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|ll", &ip, &ip_size, &port, &timeoutInMs) == FAILURE) {
         return;
     }
 
-    connection = s_create_connection(ip, port, 0);
+    connection = s_create_connection(ip, port, timeoutInMs, 0);
 
     if (!connection) {
         RETURN_FALSE;
@@ -169,6 +177,7 @@ PHP_FUNCTION(phpiredis_pconnect)
     char *ip;
     int ip_size;
     long port = 6379;
+    long timeoutInMs = 1000; // default timeout is 1 second
 
     char *hashed_details = NULL;
     int hashed_details_length;
@@ -176,7 +185,7 @@ PHP_FUNCTION(phpiredis_pconnect)
 
     zend_rsrc_list_entry new_le, *le;
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|l", &ip, &ip_size, &port) == FAILURE) {
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|ll", &ip, &ip_size, &port, &timeoutInMs) == FAILURE) {
         return;
     }
 
@@ -197,7 +206,7 @@ PHP_FUNCTION(phpiredis_pconnect)
         return;
     }
 
-    connection = s_create_connection(ip, port, 1);
+    connection = s_create_connection(ip, port, timeoutInMs, 1);
 
     if (!connection) {
         efree(hashed_details);
